@@ -8,10 +8,7 @@ A userscript that turns the **TCGplayer Seller Portal → Scan & Identify** page
 
 ## Demo
 
-<!-- Drop a screen-capture GIF here once recorded, e.g.: -->
-<!-- ![demo](docs/demo.gif) -->
-
-*(GIF coming soon — record the loop: type a number → Enter → verify → Enter → next.)*
+![Quick Match demo — type a number, Enter to open and auto-select, glance at the scan-vs-catalog comparison, Enter to save](docs/demo.gif)
 
 ---
 
