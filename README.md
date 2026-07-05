@@ -71,6 +71,12 @@ Other games with numeric collector numbers may partially work but aren't specifi
 
 This tool automates parts of your own interaction with the TCGplayer Seller Portal for personal efficiency. It keeps a human in the loop for every save. Use it in accordance with TCGplayer's Terms of Service; you are responsible for your own account and listings. Provided as-is, with no warranty (see [LICENSE](LICENSE)).
 
+## Support
+
+This tool is free and open source. If it saves you time, you can [buy me a coffee on Ko-fi](https://ko-fi.com/jesusvenegas) — entirely optional, and it helps fund continued maintenance and new features.
+
+[![Support on Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/jesusvenegas)
+
 ## License
 
 [MIT](LICENSE) © JesusEgonVenegas
