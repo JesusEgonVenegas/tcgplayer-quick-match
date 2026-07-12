@@ -26,8 +26,11 @@ Quick Match collapses that to a rhythm: **type → Enter → glance → Enter.**
 - **Auto scan-vs-catalog verifier** — on every selection it pops an enlarged side-by-side of your scan and the catalog art, with the picked card's **name / set / number / rarity** underneath (set line highlighted, since that's what separates base from event prints). Glance, confirm, save — no hovering.
 - **Recents tray + big picker** — every saved match goes into a tray. Press **Esc** for a full-screen picker: your scan on the left, the whole tray as a searchable gallery on the right. Arrow to it (or type a number that isn't saved) and Enter runs it.
 - **Dynamic phantom-row skipping** — the portal sometimes leaves already-matched "phantom" rows stuck at the top of the unidentified list. `skip: auto` detects them (by each row's `Confirm Match` state) and targets the first genuinely-unmatched row instead — however many phantoms there are. Manual `skip: 1–4` override included.
+- **Repair mode for mislabeled rows** — the scanner loves to file base cards under *"3rd Anniversary Tournament Cards"* (`OP13 ANN`). Flip `fix` on and the panel counts every mislabeled row on the page; **Enter** walks them one at a time — reading each row's own card number, opening `Find New Match`, and re-matching it to the base set. The reprint and any pre-release printing are excluded from the results outright, so they can't be picked by accident.
+- **Review mode for the Matched to Catalog tab** (**Alt+A**) — the scanner's match is usually *plausible* and sometimes wrong: same art, different set, different number. Review mode walks the matched rows one at a time with **both images blown up side by side and a synced magnifier** — moving the cursor over either card zooms *both* to the same relative spot, so you read the two card numbers against each other instead of squinting at thumbnails. The catalog's claimed name / number / set / variant / confidence / listing price sits beside them. **Enter** (or ↓/→) = numbers agree, next card. **X** = wrong, re-match it.
+- **Learned re-match patterns** — the scanner repeats its mistakes: the same bogus match comes back a dozen times in a 500-card batch. Every correction you make in review mode is banked *keyed on the wrong match* — the second time that same wrong match appears, review mode flags it in red (*"you corrected this 3× before → 54/64 Jungle"*) and **X** re-matches it in one keypress: no typing, no picking, straight to the verify overlay.
 - **Learns as you go** — remembers the name/set you picked for a given number and uses it to disambiguate next time.
-- **Undo / delete** on tray entries, session match counter, and per-row ⚡ buttons for out-of-order matching.
+- **Undo / delete** on tray entries, session match counter, and per-row ⚡ / 🔧 buttons for out-of-order matching and repair.
 
 ## Install
 
@@ -47,7 +50,37 @@ A small panel docks to the bottom-left of the page. Type into its box and:
 | Picker: **← ↑ ↓ →** / **Enter** / **Esc** | Move / pick & search / close. |
 | **Esc** (verify shown) / **×** | Dismiss the enlarged comparison. |
 | **skip** button | Cycle `auto → off → 1 → 2 → 3 → 4` (right-click steps back) to control which row is targeted. |
+| **fix** button | Toggle repair mode; the label shows how many mislabeled rows are left on the page. |
+| **Enter** (fix mode on) | Re-match the next mislabeled row to the base set of its own card number. Glance at the verify overlay, Enter again to save. |
 | ⚡ (per row) | Match that specific row with the current box value. |
+| 🔧 (per matched row) | Re-match that specific row to the base set of its own card number. |
+| **Alt+A** / **review** button | Open **review mode** on the *Matched to Catalog* tab. |
+
+### Review mode (auditing what the scanner matched)
+
+On the **Matched to Catalog** tab, press **Alt+A**. One card fills the screen at a time: your scan and the catalog art, enlarged, with the catalog's claimed number, set, variant, confidence and listing price beside them.
+
+| Key | What it does |
+|---|---|
+| **Enter** / **→** / **↓** | The numbers agree — approve and move to the next row. (Approving changes nothing on the page; it just advances.) |
+| **X** / **Backspace** | Wrong match. Opens `Find New Match` on that row with an autofocused box — type the real number and Enter. If this exact wrong match has been corrected before, it's applied *immediately* instead of prompting. |
+| **← / ↑** | Back a row (re-check one you just passed). |
+| **hover a card** / **wheel** | Synced magnifier — both images zoom to the same relative point, so the two card numbers land side by side. Wheel changes the zoom. |
+| **N** | Next page of the batch. |
+| **Home** | Back to the first row. |
+| **Esc** | Close. Your position is saved per batch, so reopening resumes where you stopped. |
+
+Corrections are remembered as **patterns**, keyed on the *wrong* match (name + number + set), because that's what repeats — a whole stack of the same card gets mismatched the same way. The **review** button shows how many patterns you've banked; right-click it to forget them all.
+
+### Fixing a batch of mislabeled cards
+
+For a batch where the scanner picked the anniversary reprint instead of the base card: click **fix** (it reads e.g. `fix: 74 bad`), then alternate **Enter** (finds the row, searches its number, selects the base-set result, shows the comparison) and **Enter** (saves). The row retires only once it's actually saved, so a cancelled or failed attempt stays queued for a retry.
+
+The set it hunts for is one regex at the top of the script — change `BAD_SET_RE` to target a different bad set:
+
+```js
+const BAD_SET_RE = /3rd Anniversary Tournament/i;
+```
 
 ## How it works (technical notes)
 
@@ -58,7 +91,7 @@ The interesting part is that the Seller Portal is a constantly-re-rendering SPA 
 - **Bleed-proof scoping** — result parsing (name/set/number/rarity, catalog art) is scoped to the *single* result item, walking up only until the enclosing multi-result list, so one card's data never bleeds into a neighbor's.
 - **Position-based row targeting** — DOM order can't be trusted (phantom rows can be hidden/duplicate nodes), so "Find Match" buttons are filtered to visible ones and sorted by on-screen vertical position.
 - **State-based phantom detection** — a matched row is identified by its `Confirm Match` button being enabled vs. disabled, which is far more robust than text/heuristic matching.
-- **Zero dependencies** — plain ES2020, no build step, ~600 lines in a single file.
+- **Zero dependencies** — plain ES2020, no build step, ~1,100 lines in a single file.
 
 ## Supported games
 

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TCGplayer Quick Match
 // @namespace    https://github.com/JesusEgonVenegas
-// @version      1.0.0
-// @description  Fast keyboard-driven catalog matching for the TCGplayer Seller Portal scan-identify page — One Piece & Pokémon, with a base-vs-reprint/parallel guard, an auto scan-vs-catalog verifier, and dynamic phantom-row skipping.
+// @version      1.2.0
+// @description  Fast keyboard-driven catalog matching for the TCGplayer Seller Portal scan-identify page — One Piece & Pokémon, with a base-vs-reprint/parallel guard, an auto scan-vs-catalog verifier, dynamic phantom-row skipping, a repair mode that re-matches rows mislabeled as anniversary reprints, and a keyboard audit mode for the Matched-to-Catalog tab (synced zoom, one-key approve, learned re-match patterns).
 // @author       JesusEgonVenegas
 // @license      MIT
 // @homepageURL  https://github.com/JesusEgonVenegas/tcgplayer-quick-match
@@ -31,6 +31,17 @@
   // skipMode: 'auto' = skip rows that already have a catalog match (phantoms) & target the first
   // truly-unmatched one; a number N = force the Nth visible row from top (0 = top). See targetFindMatch.
   let sessionCount = 0, lastSaved = null, skipMode = 'auto';
+  // repair mode: walk rows the scanner already matched to the WRONG set and re-match them to the
+  // base set. pendingFixScope is the row awaiting its Save Match, so we only retire it once saved.
+  let fixMode = false, pendingFixScope = null;
+  // rows retired this session. Keyed by ELEMENT, not card # — the same # legitimately repeats across
+  // rows when you scanned several copies. Backstop only: once saved, a row's set text stops matching
+  // BAD_SET_RE anyway; this just covers the gap before React repaints.
+  const fixedRows = new WeakSet();
+  // review (audit) mode — walk the Matched-to-Catalog rows one at a time, scan vs catalog enlarged.
+  // reviewTarget is the row whose re-match is in flight; reviewWrong is the identity we're correcting
+  // AWAY from, banked into the pattern store once the new match is saved.
+  let reviewActive = false, reviewIdx = 0, reviewTarget = null, reviewWrong = null;
 
   function waitFor(fn, timeout = CONFIG.timeoutMs) {
     return new Promise((resolve, reject) => {
@@ -111,6 +122,13 @@
     /\d+\s*\/\s*\d+/.test(s) || /^\d+$/.test(s.trim()) || OP_ONLY.test(s.trim());
 
   const NUM_RE = /\b(?:OP|ST|EB|PRB)\d{2}-\d{2,4}\b|\bP-\d{2,4}\b|\b\d{1,3}\/\d{1,3}\b/i;
+  // a PAGE ROW the scanner mislabeled — the set repair mode hunts for. Narrow on purpose: it
+  // decides which of your already-matched rows get rewritten, so it must not over-reach.
+  const BAD_SET_RE = /3rd Anniversary Tournament/i;
+  // a RESULT inside the modal that repair must never auto-pick. Belt (name) and suspenders (code):
+  // the reprint carries a suffixed code (OP13 ANN) the exact-code check already rejects, but a
+  // pre-release may share the base code (OP13) and is only tellable by its set NAME.
+  const EXCLUDE_SET_RE = /anniversary|tournament|pre-?release/i;
   const DETAILS_SEL = '.find-catalog-match-details__search-results-list-item-details';
   // the details block of THIS result only — handles the button being inside details or in
   // a sibling column, and never bleeds into neighbouring results (stops at the multi-item list).
@@ -137,16 +155,23 @@
     }
     return scope;
   }
-  // the set code in parens on a result, e.g. "Carrying On His Will(OP13)" -> "OP13",
-  // "...3rd Anniversary... (OP13 ANN)" -> "OP13 ANN". This is what tells base from reprint.
-  function setCodeOf(btn) {
-    const d = resultDetails(btn);
-    const t = d ? txt(d.querySelector('.color-surface-subdued')) : '';
+  // a result's set line, e.g. "Carrying On His Will(OP13)" or
+  // "Carrying On His Will: 3rd Anniversary Tournament Cards(OP13 ANN)" — carries BOTH the set
+  // name and, in parens, the set code. This is what tells base from reprint.
+  const setLineIn = d => (d ? txt(d.querySelector('.color-surface-subdued')) : '');
+  const setLineOf = btn => setLineIn(resultDetails(btn));
+  const parenCode = t => {
     const m = t.match(/\(([^)]+)\)\s*$/) || t.match(/\(([^)]+)\)/);
     return m ? m[1] : '';
-  }
+  };
+  const setCodeOf = btn => parenCode(setLineOf(btn));
 
-  async function quickMatch(findMatchBtn, query, setStatus) {
+  // opts.pinBaseSet — ignore the tray's learned set, force the number's own prefix (repair mode).
+  // opts.excludeSet  — regex; results whose set line matches are never candidates at all.
+  // opts.setName     — require the result's set LINE to contain this text. Pokémon results carry no
+  //                    paren set code, so a saved re-match pattern ("this art is really Jungle, not
+  //                    Hidden Fates") can only pin its set by name. Falls back if nothing matches.
+  async function quickMatch(findMatchBtn, query, setStatus, opts = {}) {
     setStatus('opening…');
     findMatchBtn.click();
     const modal = await waitFor(getModal);
@@ -171,14 +196,24 @@
     const learnedSet = learnedSets.length === 1 ? learnedSets[0] : '';
     // set-code preference is One Piece-only (gated on setPrefix); Pokémon keeps its name-based
     // disambiguation untouched, since its result rows don't carry a paren set code to filter on.
-    const prefSet = setPrefix ? (learnedSet || setPrefix) : '';
-    setStatus('searching…' + (learnedName ? ' →' + learnedName : prefSet ? ' [' + prefSet + ']' : ''));
+    // Repair pins the bare prefix: a prior pass may have taught the tray the very reprint we're undoing.
+    const prefSet = setPrefix ? (opts.pinBaseSet ? setPrefix : (learnedSet || setPrefix)) : '';
+    const wantSetName = (opts.setName || '').trim().toLowerCase();
+    setStatus((opts.pinBaseSet ? 'repairing…' : 'searching…') +
+      (wantSetName ? ' [' + opts.setName + ']' : '') +
+      (learnedName ? ' →' + learnedName : prefSet ? ' [' + prefSet + ']' : ''));
     await triggerSearch(modal, input, query);
 
     if (isNumber(query)) {
       setStatus('selecting…');
       const nameOf = b => { const d = resultDetails(b); return d ? txt(d.querySelector('.font-weight-600')) : ''; };
+      // repair: drop the printings we're correcting AWAY from before anything else sees them, so
+      // they can't win a fallback or inflate the printings guard. Test the set line; only if that
+      // element is missing do we fall back to the whole details text (a card NAME could false-positive).
+      const badSet = b => !!opts.excludeSet &&
+        opts.excludeSet.test(setLineOf(b) || txt(resultDetails(b)));
       const exact = () => buttonsIn(modal).filter(b => txt(b) === 'Select')
+        .filter(b => !badSet(b))
         .filter(b => want ? cellNumber(b) === want : txt(resultDetails(b) || b).includes(query));
       // rarity + finish for a result: "OP13-060, Common, Normal, English" -> "Common, Normal".
       // Two results sharing a # but differing here are different PRINTINGS (base vs alt-art/manga/foil).
@@ -196,12 +231,13 @@
         let c = exact();
         if (!c.length) return c;
         if (prefSet) { const s = c.filter(b => normCode(setCodeOf(b)) === normCode(prefSet)); if (s.length) c = s; else if (strict) return []; }
+        if (wantSetName) { const s = c.filter(b => setLineOf(b).toLowerCase().includes(wantSetName)); if (s.length) c = s; else if (strict) return []; }
         if (learnedName) { const nm = c.filter(b => nameOf(b).toLowerCase() === learnedName.toLowerCase()); if (nm.length) c = nm; else if (strict) return []; }
         return c;
       }
       const pick = () => { const c = narrow(true); return c.length ? c[0] : null; };
       // wait for the preferred result; if it never resolves (stale set/name), fall back to first exact match
-      const preferred = learnedName || prefSet;
+      const preferred = learnedName || prefSet || wantSetName;
       let select = null;
       try { select = await waitFor(pick, preferred ? 4500 : CONFIG.timeoutMs); } catch (_) {}
       if (!select) select = exact()[0] || null;
@@ -271,6 +307,8 @@
       '<span id="qm-count" title="matched this session" style="font-size:12px;color:#7ec27e">✓0</span>' +
       '<button id="qm-undo" title="remove last tray entry &amp; reload its number" style="cursor:pointer;background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px">⎌</button>' +
       '<button id="qm-skip" title="glitched phantom on top? target the 2nd unmatched row instead" style="cursor:pointer;border-radius:4px;padding:2px 6px">skip top</button>' +
+      '<button id="qm-fix" style="cursor:pointer;border-radius:4px;padding:2px 6px">fix: off</button>' +
+      '<button id="qm-review" title="audit the Matched to Catalog rows one by one (Alt+A)" style="cursor:pointer;background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px">review</button>' +
       '<button id="qm-clear" title="clear recents" style="cursor:pointer;background:#333;color:#aaa;border:1px solid #555;border-radius:4px;padding:2px 6px">clear</button>' +
     '</div>' +
     '<div id="qm-recents" style="display:flex;gap:6px;flex-wrap:nowrap;margin-top:8px;overflow-x:auto;overflow-y:hidden;padding-bottom:4px"></div>';
@@ -316,6 +354,28 @@
   skipBtn.oncontextmenu = e => { e.preventDefault(); cycleSkip(-1); };   // right-click steps back
   skipBtn.title = 'phantom rows on top? left-click to cycle skip (auto/off/1-4), right-click to step back';
   renderSkip();
+
+  // repair toggle. On, Enter stops matching unidentified rows and starts re-matching the mislabeled
+  // ones instead — same two-keystroke rhythm (Enter to pick, glance, Enter to save).
+  const fixBtn = panel.querySelector('#qm-fix');
+  const renderFix = () => {
+    const n = fixMode ? badRows().length : 0;
+    fixBtn.textContent = fixMode ? 'fix: ' + n + ' bad' : 'fix: off';
+    fixBtn.style.background = fixMode ? '#12507a' : '#333';
+    fixBtn.style.color = fixMode ? '#9fd2ff' : '#aaa';
+    fixBtn.style.border = '1px solid ' + (fixMode ? '#3a86c9' : '#555');
+    fixBtn.title = 'repair rows mislabeled "' + BAD_SET_RE.source.replace(/\\/g, '') +
+      '" — Enter re-matches the next one to its base set';
+  };
+  fixBtn.onclick = () => {
+    fixMode = !fixMode;
+    pendingFixScope = null;
+    renderFix();
+    if (!fixMode) { setStatus('fix: off'); return; }
+    const n = badRows().length;
+    setStatus(n ? 'fix: ' + n + ' mislabeled — Enter to start' : 'fix: none found on this page', n ? 'warn' : undefined);
+  };
+  renderFix();
   panel.querySelector('#qm-clear').onclick = () => { recents = []; saveRecents(recents); renderRecents(); };
   panel.querySelector('#qm-undo').onclick = () => {
     if (!lastSaved) { setStatus('nothing to undo'); return; }
@@ -429,9 +489,13 @@
   // which unmatched row we act on: normally the top one, but skip it when a phantom haunts position 1.
   // filter to VISIBLE buttons and sort by on-screen vertical position — DOM order can't be trusted
   // (a glitch row may be a hidden/duplicate node or sit out of document order).
-  const findMatchBtns = () => [...document.querySelectorAll('button')]
-    .filter(b => txt(b) === 'Find Match' && b.getClientRects().length)
+  // 'Find Match' sits on rows with NO catalog match; 'Find New Match' on rows already matched
+  // (right or wrong). Repair mode drives the latter.
+  const FIND_MATCH = 'Find Match', FIND_NEW = 'Find New Match';
+  const visibleBtns = label => [...document.querySelectorAll('button')]
+    .filter(b => txt(b) === label && b.getClientRects().length)
     .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  const findMatchBtns = () => visibleBtns(FIND_MATCH);
   const isDisabled = b => !!b && (b.disabled === true || b.getAttribute('aria-disabled') === 'true' ||
     getComputedStyle(b).cursor === 'not-allowed');
   // the Delete / Confirm Match / Find Match trio share a small container — find THIS row's Confirm Match
@@ -468,6 +532,31 @@
     }
     return list[Math.min(skipMode, list.length - 1)];  // manual: Nth from top
   };
+
+  // ---- repair mode: rows the scanner matched to the wrong set ----
+  // The largest ancestor of a row's button that still holds exactly ONE such button — i.e. this row
+  // alone. Climbing past that swallows a neighbour, and we'd read ITS set line and card number.
+  function rowScopeOf(btn, label) {
+    let scope = btn, n = btn.parentElement;
+    for (let i = 0; i < 12 && n; i++) {
+      if ([...n.querySelectorAll('button')].filter(b => txt(b) === label).length !== 1) break;
+      scope = n; n = n.parentElement;
+    }
+    return scope;
+  }
+  // "(OP13 ANN)" can't match NUM_RE (it demands -NNN), so the row's own card # is the only hit.
+  const rowNumberOf = scope => (txt(scope).match(NUM_RE) || [])[0] || '';
+  const rowIsBad = scope => BAD_SET_RE.test(txt(scope));
+  function badRows() {
+    const out = [];
+    for (const btn of visibleBtns(FIND_NEW)) {
+      const scope = rowScopeOf(btn, FIND_NEW);
+      if (fixedRows.has(scope) || !rowIsBad(scope)) continue;
+      const num = rowNumberOf(scope);
+      if (num) out.push({ btn, scope, num });   // no readable # -> never guess, leave it for the eye
+    }
+    return out;
+  }
   const PCOLS = 5;                       // gallery columns; up/down move by this many
   let pickerEl = null, pGrid = null, pCountEl = null, pList = [], pIdx = 0;
 
@@ -587,6 +676,415 @@
     fInput.focus();
   }
 
+  // ================= review (audit) mode: Matched to Catalog =================
+  // The scanner's match is usually *plausible* and sometimes wrong: same art, different set, different
+  // card #. The only tell is reading the # off BOTH images. So: walk the matched rows one at a time,
+  // both images blown up with a synced magnifier, the catalog's claimed #/set/variant/price beside
+  // them. One key to approve, one key to re-match. Corrections are banked as PATTERNS — the scanner
+  // repeats its mistakes, so the second time we see the same wrong match we prefill and auto-select
+  // the correction for you.
+
+  // ---- learned re-match patterns: wrong identity (what the scanner claimed) -> right one ----
+  const FIXES_KEY = 'qm-fixes';
+  const loadFixes = () => { try { return JSON.parse(localStorage.getItem(FIXES_KEY)) || {}; } catch (_) { return {}; } };
+  let fixes = loadFixes();
+  const saveFixes = () => localStorage.setItem(FIXES_KEY, JSON.stringify(fixes));
+  // key on the WRONG match, not the scan: that's what repeats. Same bogus name+#+set -> same fix.
+  const wrongKey = w => [w.name, w.num, w.set].map(s => (s || '').trim().toLowerCase()).join('|');
+  const fixFor = row => (row && row.num ? fixes[wrongKey(row)] : null) || null;
+  const setLabel = f => (f.setName || f.set || '');
+  function recordFix(wrong, right) {
+    if (!wrong || !wrong.num || !right.num) return;
+    const sameNum = wrong.num.toLowerCase() === right.num.toLowerCase();
+    const sameSet = (wrong.set || '').toLowerCase() === setLabel(right).toLowerCase();
+    if (sameNum && sameSet) return;                       // re-picked the same card — nothing learned
+    const k = wrongKey(wrong), prev = fixes[k];
+    fixes[k] = { wrong, num: right.num, name: right.name, set: right.set, setName: right.setName,
+                 scan: right.scan || '', catalog: right.catalog || '', count: (prev ? prev.count : 0) + 1 };
+    saveFixes();
+    renderReviewBtn();
+  }
+
+  // ---- read a matched row: images by caption, fields by label ----
+  const CAPTION_RE = /^(Scan Image|Catalog Image)$/i;
+  const imgIn = n => {
+    const urls = [];
+    for (const d of n.querySelectorAll('[data-imageurl]')) {
+      const u = d.getAttribute('data-imageurl');
+      if (u && !u.startsWith('data:')) urls.push(u);
+    }
+    if (!urls.length) for (const im of n.querySelectorAll('img')) {
+      if (im.src && !im.src.startsWith('data:')) urls.push(im.src);
+    }
+    return urls;
+  };
+  // climb from the "Scan Image" / "Catalog Image" caption until exactly ONE image is in scope — one
+  // more level up would swallow the neighbouring card and we'd show the wrong art.
+  function imgByCaption(scope, caption) {
+    for (const el of scope.querySelectorAll('*')) {
+      if (!CAPTION_RE.test(txt(el)) || txt(el).toLowerCase() !== caption.toLowerCase()) continue;
+      let n = el;
+      for (let i = 0; i < 5 && n && n !== scope.parentElement; i++) {
+        const urls = imgIn(n);
+        if (urls.length === 1) return urls[0];
+        if (urls.length > 1) break;               // climbed into both cards — give up, use the fallback
+        n = n.parentElement;
+      }
+    }
+    return '';
+  }
+  function rowArt(scope) {
+    let scan = imgByCaption(scope, 'Scan Image');
+    let catalog = imgByCaption(scope, 'Catalog Image');
+    if (!scan || !catalog) {                      // captions missing (list view / re-render): host tells them apart
+      const urls = imgIn(scope);
+      if (!catalog) catalog = urls.find(u => u.includes('product-images')) || '';
+      if (!scan) scan = urls.find(u => u !== catalog) || '';
+    }
+    return { scan, catalog };
+  }
+  // the SMALLEST element whose text starts with the label and carries a value ("Card #: 41/68").
+  // Ancestors start with the card name, the label span alone has no value — both excluded.
+  function fieldEl(scope, label) {
+    let best = null, bestLen = Infinity;
+    for (const el of scope.querySelectorAll('*')) {
+      const t = txt(el);
+      if (t.length <= label.length || !t.startsWith(label)) continue;
+      if (t.length < bestLen) { best = el; bestLen = t.length; }
+    }
+    return best;
+  }
+  const fieldOf = (scope, label) => {
+    const el = fieldEl(scope, label);
+    return el ? txt(el).slice(label.length).trim() : '';
+  };
+  // the row's card name: the last real text before the "Card #:" field (the captions and the images
+  // come first in DOM order, the labelled fields after).
+  function rowNameOf(scope) {
+    const numEl = fieldEl(scope, 'Card #:');
+    let name = '';
+    for (const el of scope.querySelectorAll('*')) {
+      // stop once we're INSIDE the card-# field — not at its ancestors, which come first in document
+      // order and would cut the walk short before it ever reaches the name.
+      if (numEl && (el === numEl || numEl.contains(el))) break;
+      if (el.children.length) continue;                       // leaves only
+      const t = txt(el);
+      if (!t || CAPTION_RE.test(t) || /:$/.test(t) || el.closest('button')) continue;
+      name = t;
+    }
+    return name;
+  }
+  function priceOf(scope) {
+    const all = txt(scope), i = all.indexOf('Listing Price');
+    const t = i >= 0 ? all.slice(i) : all;
+    const p = t.match(/\$\d[\d,]*\.\d{2}/);
+    const mk = t.match(/TCG\s+(?:Market|Low|Mid)\s*[+\-−]?\s*\$?\d[\d,]*\.\d{2}/i);
+    return { price: p ? p[0] : '', market: mk ? mk[0] : '' };
+  }
+  function parseRow(scope) {
+    const { price, market } = priceOf(scope);
+    return {
+      ...rowArt(scope),
+      name: rowNameOf(scope),
+      num: fieldOf(scope, 'Card #:'),
+      set: fieldOf(scope, 'Set:'),
+      variant: fieldOf(scope, 'Variant:'),
+      conf: fieldOf(scope, 'Match Confidence:'),
+      seq: fieldOf(scope, 'Import sequence #:'),
+      price, market
+    };
+  }
+  // every matched row on the page, top to bottom. Re-read on every move — React re-renders rows
+  // constantly, so a cached element list goes stale the moment a match is saved. Only the row we're
+  // actually looking at gets scoped + parsed; walking 100 rows' subtrees per keypress is wasted work.
+  const reviewBtns = () => visibleBtns(FIND_NEW);
+  function reviewRow(i, list) {
+    const btn = (list || reviewBtns())[i];
+    if (!btn) return null;
+    const scope = rowScopeOf(btn, FIND_NEW);
+    return { btn, scope, ...parseRow(scope) };
+  }
+  // resume where you left off — a 500-card batch is many sittings. Keyed by batch (the URL path).
+  const progKey = () => 'qm-review-at:' + location.pathname;
+  const nextPageBtn = () => [...document.querySelectorAll('button,a')]
+    .filter(e => e.getClientRects().length && !isDisabled(e))
+    .find(e => /next/i.test(e.getAttribute('aria-label') || '') || /^(›|>|→|»)$/.test(txt(e))) || null;
+
+  // ---- overlay ----
+  let reviewEl = null, zPanes = [], zOn = false, zLevel = 2.8, zPx = 50, zPy = 50, fixInput = null;
+  const reviewBtn = () => panel.querySelector('#qm-review');
+  function renderReviewBtn() {
+    const b = reviewBtn(); if (!b) return;
+    const n = Object.keys(fixes).length;
+    b.textContent = (reviewActive ? 'review ●' : 'review') + (n ? ' (' + n + ')' : '');
+    b.style.background = reviewActive ? '#155e3f' : '#333';
+    b.style.color = reviewActive ? '#9ff0c8' : '#aaa';
+    b.style.border = '1px solid ' + (reviewActive ? '#2fa476' : '#555');
+    b.title = 'audit the Matched to Catalog rows one by one (Alt+A)' +
+      (n ? ' — ' + n + ' learned re-match pattern' + (n === 1 ? '' : 's') + ' (right-click to clear)' : '');
+  }
+  function paintZoom() {
+    for (const im of zPanes) {
+      im.style.transformOrigin = zPx + '% ' + zPy + '%';
+      im.style.transform = 'scale(' + (zOn ? zLevel : 1) + ')';
+    }
+    const z = reviewEl && reviewEl.querySelector('#qm-rzoom');
+    if (z) z.textContent = zOn ? zLevel.toFixed(1) + '×' : 'hover a card to magnify · wheel = zoom';
+  }
+  const hideReview = () => { if (reviewEl) reviewEl.style.display = 'none'; };
+  function closeReview() {
+    reviewActive = false; reviewTarget = null; reviewWrong = null;
+    if (reviewEl) { reviewEl.remove(); reviewEl = null; }
+    zPanes = []; fixInput = null;
+    renderReviewBtn();
+    setStatus('review closed');
+    qInput.focus();
+  }
+  function openReview() {
+    const n = reviewBtns().length;
+    if (!n) { setStatus('no matched rows here — open the Matched to Catalog tab', 'warn'); return; }
+    if (getModal()) { setStatus('close the match dialog first', 'warn'); return; }
+    reviewActive = true;
+    const saved = parseInt(localStorage.getItem(progKey()) || '0', 10);
+    reviewIdx = Number.isFinite(saved) ? Math.min(Math.max(saved, 0), n - 1) : 0;
+    renderReviewBtn();
+    renderReview(saved > 0 ? 'resumed where you left off — Home to start over' : '');
+  }
+
+  function reviewGo(delta) {
+    const n = reviewBtns().length;
+    if (!n) return;
+    const next = reviewIdx + delta;
+    if (next >= n) {
+      reviewIdx = n - 1;
+      renderReview('page done — every row on this page reviewed. N = next page · Esc = close');
+      return;
+    }
+    reviewIdx = Math.max(0, next);
+    localStorage.setItem(progKey(), String(reviewIdx));
+    renderReview();
+  }
+
+  // wrong match -> hand the row to the normal match pipeline. A learned pattern runs it immediately
+  // (search + auto-select + the printings guard + the verify overlay); otherwise you type the #.
+  function reviewFix() {
+    const row = reviewRow(reviewIdx);
+    if (!row) return;
+    const known = fixFor(row);
+    if (known) {
+      reviewWrong = { name: row.name, num: row.num, set: row.set };
+      reviewTarget = row;
+      hideReview();
+      qInput.value = known.num;
+      renderRecents(known.num);
+      setStatus('known bad match → ' + known.num + (setLabel(known) ? ' ' + setLabel(known) : '') + ' — verify & Enter', 'warn');
+      run(row.btn, { query: known.num, setName: known.setName || '', scan: row.scan });
+      return;
+    }
+    openFixPrompt(row);
+  }
+  // no pattern yet: prompt inside the overlay, autofocused, tray entries as live suggestions.
+  function openFixPrompt(row) {
+    if (!reviewEl) return;
+    const bar = reviewEl.querySelector('#qm-rfix');
+    bar.style.display = 'block';
+    bar.innerHTML =
+      '<div style="display:flex;gap:10px;align-items:center">' +
+        '<span style="color:#ff9b9b;font-weight:700;white-space:nowrap">✗ wrong — correct #:</span>' +
+        '<input id="qm-rfixin" placeholder="e.g. 54/64 or OP13-060 — or a name" ' +
+          'style="flex:1;padding:8px 10px;background:#000;color:#fff;border:1px solid #666;border-radius:6px;font:14px sans-serif">' +
+        '<span style="color:#888;font-size:12px;white-space:nowrap">Enter = search · Esc = back</span>' +
+      '</div>' +
+      '<div id="qm-rsugg" style="display:flex;gap:6px;margin-top:8px;overflow-x:auto"></div>';
+    const sugg = bar.querySelector('#qm-rsugg');
+    const renderSugg = f => {
+      const q = f.toLowerCase();
+      sugg.innerHTML = '';
+      recents.filter(r => !q || (r.num || '').toLowerCase().includes(q) ||
+                                (r.name || '').toLowerCase().includes(q) ||
+                                (r.setName || r.set || '').toLowerCase().includes(q))
+        .slice(0, 12)
+        .forEach(r => {
+          const chip = document.createElement('button');
+          chip.textContent = [r.num, r.name].filter(Boolean).join(' · ');
+          chip.style.cssText = 'flex:0 0 auto;cursor:pointer;background:#222;color:#ddd;border:1px solid #555;border-radius:14px;padding:4px 10px;font-size:12px;white-space:nowrap';
+          chip.onclick = () => submitFix(row, r.num, r.setName || '');
+          sugg.appendChild(chip);
+        });
+    };
+    renderSugg('');
+    fixInput = bar.querySelector('#qm-rfixin');
+    fixInput.addEventListener('input', () => renderSugg(fixInput.value.trim()));
+    fixInput.addEventListener('keydown', e => {
+      e.stopPropagation();                                   // the review keymap must not eat typing
+      if (e.key === 'Escape') { e.preventDefault(); closeFixPrompt(); }
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        const v = fixInput.value.trim();
+        if (v) submitFix(row, v, '');
+      }
+    });
+    fixInput.focus();
+  }
+  function closeFixPrompt() {
+    const bar = reviewEl && reviewEl.querySelector('#qm-rfix');
+    if (bar) { bar.style.display = 'none'; bar.innerHTML = ''; }
+    fixInput = null;
+    if (reviewEl) reviewEl.focus();
+  }
+  function submitFix(row, query, setName) {
+    reviewWrong = { name: row.name, num: row.num, set: row.set };
+    reviewTarget = row;
+    closeFixPrompt();
+    hideReview();
+    qInput.value = query;
+    renderRecents(query);
+    run(row.btn, { query, setName, scan: row.scan });
+  }
+
+  // art can still be lazy-loading when we land on a row; re-render once per row rather than sitting
+  // on a "no image" placeholder. Keyed by index so a genuinely artless row can't loop forever.
+  let artRetry = -1;
+  function renderReview(note) {
+    if (!reviewActive) return;
+    const list = reviewBtns();
+    if (!list.length) { setStatus('no matched rows on this page', 'warn'); return; }
+    reviewIdx = Math.min(reviewIdx, list.length - 1);
+    try { list[reviewIdx].scrollIntoView({ block: 'center' }); } catch (_) {}
+    const row = reviewRow(reviewIdx, list);
+    if (!row) return;
+    if ((!row.scan || !row.catalog) && artRetry !== reviewIdx) {
+      artRetry = reviewIdx;
+      setTimeout(() => { if (reviewActive && artRetry === reviewIdx) renderReview(note); }, 500);
+    }
+
+    if (!reviewEl) {
+      reviewEl = document.createElement('div');
+      reviewEl.tabIndex = -1;
+      reviewEl.style.cssText = 'position:fixed;inset:0;z-index:100002;background:rgba(8,8,8,.96);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:18px;font:13px sans-serif;outline:none';
+      document.body.appendChild(reviewEl);
+    }
+    reviewEl.style.display = 'flex';
+
+    const H = Math.round(Math.min(560, window.innerHeight * 0.52)), W = Math.round(H * 0.716);
+    const known = fixFor(row);
+    const pane = (src, lab, tone) =>
+      '<div style="text-align:center">' +
+        '<div class="qm-zwrap" style="width:' + W + 'px;height:' + H + 'px;overflow:hidden;border-radius:12px;background:#000;border:1px solid #333;cursor:crosshair">' +
+          (src ? '<img class="qm-zimg" src="' + src + '" style="width:100%;height:100%;object-fit:contain;transition:transform .05s linear;will-change:transform">'
+               : '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#666">no image</div>') +
+        '</div>' +
+        '<div style="margin-top:7px;font-size:13px;font-weight:600;color:' + tone + '">' + lab + '</div>' +
+      '</div>';
+    const field = (k, v, tone) => v
+      ? '<div style="display:flex;gap:8px"><span style="color:#7d7d7d;min-width:96px">' + k + '</span>' +
+        '<span style="color:' + (tone || '#eee') + ';font-weight:600">' + esc(v) + '</span></div>'
+      : '';
+    const conf = row.conf || '';
+    const confTone = /good|high/i.test(conf) ? '#7ec27e' : /low|poor/i.test(conf) ? '#ff9b9b' : '#ffcf5a';
+    const banner = known
+      ? '<div style="background:#3a1414;border:1px solid #b34848;color:#ffc9c9;border-radius:8px;padding:8px 12px;font-size:13px;text-align:center">' +
+          '⚠ you corrected this exact match ' + known.count + '× before → <b>' + esc(known.num) +
+          (setLabel(known) ? ' · ' + esc(setLabel(known)) : '') + '</b> — press <b>X</b> to auto-fix' +
+        '</div>'
+      : '';
+
+    reviewEl.innerHTML =
+      '<div style="display:flex;gap:14px;align-items:center;color:#ddd">' +
+        '<span style="font-size:15px;font-weight:700">Review match</span>' +
+        '<span style="color:#8ab4ff;font-weight:700">' + (reviewIdx + 1) + ' / ' + list.length + '</span>' +
+        (row.seq ? '<span style="color:#777">import #' + esc(row.seq) + '</span>' : '') +
+        '<span id="qm-rzoom" style="color:#777"></span>' +
+      '</div>' +
+      banner +
+      '<div style="display:flex;gap:22px;align-items:flex-start">' +
+        pane(row.scan, 'your scan', '#cfe') + pane(row.catalog, 'catalog match', '#ffcf5a') +
+        '<div style="min-width:250px;max-width:340px;background:#101010;border:1px solid #2a2a2a;border-radius:10px;padding:12px 14px;line-height:1.9">' +
+          '<div style="font-size:17px;font-weight:700;color:#fff;margin-bottom:6px">' + esc(row.name || '—') + '</div>' +
+          field('Card #', row.num, '#8ab4ff') +
+          field('Set', row.set, '#ffcf5a') +
+          field('Variant', row.variant) +
+          field('Confidence', conf, confTone) +
+          field('Listing', [row.price, row.market].filter(Boolean).join('  '), '#7ec27e') +
+        '</div>' +
+      '</div>' +
+      '<div id="qm-rfix" style="display:none;width:min(900px,92vw);background:#141414;border:1px solid #555;border-radius:10px;padding:12px 14px"></div>' +
+      '<div style="color:#9a9a9a;font-size:13px;text-align:center;line-height:1.7">' +
+        '<b style="color:#7ec27e">Enter / → / ↓</b> = numbers match, next &nbsp;·&nbsp; ' +
+        '<b style="color:#ff9b9b">X</b> = wrong, re-match &nbsp;·&nbsp; ' +
+        '<b style="color:#ddd">← / ↑</b> back &nbsp;·&nbsp; <b style="color:#ddd">N</b> next page &nbsp;·&nbsp; ' +
+        '<b style="color:#ddd">Esc</b> close' +
+        (note ? '<div style="color:#ffcf3f;font-weight:700;margin-top:6px">' + esc(note) + '</div>' : '') +
+      '</div>';
+
+    zPanes = [...reviewEl.querySelectorAll('.qm-zimg')];
+    for (const wrap of reviewEl.querySelectorAll('.qm-zwrap')) {
+      // synced magnifier: the cursor's spot on EITHER card zooms BOTH to the same relative point —
+      // the whole job is reading the # in the same corner of two images that otherwise look alike.
+      wrap.addEventListener('mousemove', e => {
+        const r = wrap.getBoundingClientRect();
+        zPx = ((e.clientX - r.left) / r.width) * 100;
+        zPy = ((e.clientY - r.top) / r.height) * 100;
+        zOn = true; paintZoom();
+      });
+      wrap.addEventListener('mouseleave', () => { zOn = false; paintZoom(); });
+      wrap.addEventListener('wheel', e => {
+        e.preventDefault();
+        zLevel = Math.min(6, Math.max(1.2, zLevel + (e.deltaY < 0 ? 0.3 : -0.3)));
+        paintZoom();
+      }, { passive: false });
+    }
+    paintZoom();
+    reviewEl.focus();
+    setStatus('reviewing ' + (reviewIdx + 1) + '/' + list.length);
+  }
+
+  async function reviewNextPage() {
+    const btn = nextPageBtn();
+    if (!btn) { renderReview('no next-page button found — page it yourself, then reopen review'); return; }
+    const before = (reviewRow(0) || {}).seq || '';
+    setStatus('next page…');
+    btn.click();
+    try {
+      await waitFor(() => {
+        const r = reviewRow(0);
+        return r && r.seq && r.seq !== before ? r : null;
+      }, 10000);
+    } catch (_) {}
+    reviewIdx = 0;
+    localStorage.setItem(progKey(), '0');
+    renderReview();
+  }
+
+  // the review keymap. Capture phase so it wins over the page, but never while the fix prompt is
+  // taking your typing (that input stops propagation itself).
+  document.addEventListener('keydown', e => {
+    if (e.altKey && (e.key === 'a' || e.key === 'A')) {
+      e.preventDefault();
+      reviewActive ? closeReview() : openReview();
+      return;
+    }
+    if (!reviewActive || !reviewEl || reviewEl.style.display === 'none' || fixInput) return;
+    const k = e.key;
+    if (k === 'Enter' || k === 'ArrowRight' || k === 'ArrowDown') { e.preventDefault(); reviewGo(1); }
+    else if (k === 'ArrowLeft' || k === 'ArrowUp') { e.preventDefault(); reviewGo(-1); }
+    else if (k === 'x' || k === 'X' || k === 'Backspace') { e.preventDefault(); reviewFix(); }
+    else if (k === 'n' || k === 'N') { e.preventDefault(); reviewNextPage(); }
+    else if (k === 'Home') { e.preventDefault(); reviewIdx = 0; renderReview(); }
+    else if (k === 'Escape') { e.preventDefault(); closeReview(); }
+  }, true);
+
+  reviewBtn().onclick = () => { reviewActive ? closeReview() : openReview(); };
+  reviewBtn().oncontextmenu = e => {
+    e.preventDefault();
+    const n = Object.keys(fixes).length;
+    if (!n) { setStatus('no learned patterns'); return; }
+    if (confirm('Forget all ' + n + ' learned re-match pattern(s)?')) {
+      fixes = {}; saveFixes(); renderReviewBtn(); setStatus('patterns cleared');
+    }
+  };
+  renderReviewBtn();
+
   // Enter's happy-path state machine, factored out so the picker can trigger a search too.
   function runEnter() {
     const modal = getModal();
@@ -604,8 +1102,28 @@
       qInput.focus();
       return;
     }
+    // a review re-match is in flight (its search failed, or you retyped): retry on THAT row — never
+    // fall through to targetFindMatch, which hunts unmatched rows on the other tab entirely.
+    if (reviewTarget) {
+      run(reviewTarget.btn, { query: qInput.value.trim(), scan: reviewTarget.scan });
+      return;
+    }
+    if (fixMode) {
+      const [row] = badRows();
+      if (!row) { setStatus('no mislabeled rows left ✓', 'ok'); return; }
+      qInput.value = row.num;            // so the tray filters + the Save handler bank the right #
+      renderRecents(row.num);
+      fixRow(row);
+      return;
+    }
     const fm = targetFindMatch();
     if (fm) run(fm); else setStatus('no rows left');
+  }
+  // re-match one row to the base set of its OWN card number. The row is retired only on Save
+  // (see the Save Match handler), so a failed or cancelled attempt stays queued for a retry.
+  function fixRow(row) {
+    pendingFixScope = row.scope;
+    run(row.btn, { query: row.num, pinBaseSet: true, excludeSet: EXCLUDE_SET_RE });
   }
   renderRecents();
   updateCounter();
@@ -658,7 +1176,7 @@
     const d = resultDetails(btn);
     if (!d) return null;
     const name = txt(d.querySelector('.font-weight-600'));
-    const setLine = txt(d.querySelector('.color-surface-subdued'));   // e.g. "A Fist of Divine Speed(OP11)"
+    const setLine = setLineIn(d);   // e.g. "A Fist of Divine Speed(OP11)"
     const full = txt(d);
     const num = (full.match(NUM_RE) || [])[0] || '';
     let tail = '';
@@ -676,18 +1194,28 @@
     pendingCard = cardFromCell(row);
     if (details) {
       pendingName = txt(details.querySelector('.font-weight-600'));
-      const setText = txt(details.querySelector('.color-surface-subdued'));
-      const sm = setText.match(/\(([^)]+)\)\s*$/) || setText.match(/\(([^)]+)\)/);
-      pendingSet = sm ? sm[1] : '';
+      const setText = setLineIn(details);
+      pendingSet = parenCode(setText);
       pendingSetName = setText.replace(/\s*\([^)]*\)\s*$/, '').trim();
     }
   }
   document.addEventListener('click', e => {
-    if (!pendingThumb) return;                                  // cheap gate: nothing pending
+    // cheap gate: nothing pending. A repair can have no scan thumb (matched rows sometimes fail to
+    // load their art) yet still needs its Save intercepted, so pendingFixScope also opens the gate.
+    if (!pendingThumb && !pendingFixScope && !reviewTarget) return;
     const btn = e.target.closest && e.target.closest('button');
     if (!btn) return;
     const label = txt(btn);
-    if (label === 'Cancel') { hideVerify(); return; }           // bailed on the match — drop the compare
+    // bailed on the match — drop the compare, and requeue the row so Enter offers it again
+    if (label === 'Cancel') {
+      hideVerify();
+      pendingFixScope = null;
+      if (reviewTarget) {                       // back to the same row, still unapproved
+        reviewTarget = null; reviewWrong = null;
+        if (reviewActive) renderReview('re-match cancelled — row left as it was');
+      }
+      return;
+    }
     if (label !== 'Select' && label !== 'Save Match') return;   // skip getModal for normal clicks
     if (!getModal()) return;
     if (label === 'Select') {
@@ -701,35 +1229,79 @@
                   name: pendingName, set: pendingSet, setName: pendingSetName });
       lastSaved = recents[0];
       sessionCount++; updateCounter();
-      setStatus('saved to tray ✓');
+      if (pendingFixScope) {
+        fixedRows.add(pendingFixScope);   // retire the row: it's corrected, don't offer it again
+        pendingFixScope = null;
+        renderFix();                      // the counter drops even before React repaints the row
+        setStatus('fixed ✓ — ' + badRows().length + ' left', 'ok');
+      } else if (reviewTarget) {
+        // bank the pattern (wrong match -> the one you just picked) and walk on. The scanner repeats
+        // itself, so the next row with this same wrong match auto-fills the correction.
+        recordFix(reviewWrong, { num: pendingNum || pendingQuery, name: pendingName, set: pendingSet,
+                                 setName: pendingSetName, catalog: pendingCard, scan: pendingThumb });
+        const learned = wrongKey(reviewWrong || {});
+        reviewTarget = null; reviewWrong = null;
+        setStatus('re-matched ✓ — pattern learned', 'ok');
+        if (reviewActive) setTimeout(() => {          // let React repaint the row before we re-read it
+          if (reviewActive) reviewGo(1);
+        }, 700);
+        console.debug('[QuickMatch] learned re-match for', learned);
+      } else {
+        setStatus('saved to tray ✓');
+      }
       pendingThumb = null; pendingNum = ''; pendingCard = '';
       pendingName = ''; pendingSet = ''; pendingSetName = '';
     }
   }, true);
 
-  async function run(findMatchBtn) {
-    const query = qInput.value.trim();
+  async function run(findMatchBtn, opts = {}) {
+    const query = (opts.query || qInput.value).trim();
     if (!query) { setStatus('type a # or name'); qInput.focus(); return; }
     hideVerify();                          // clear any prior card's comparison before starting a new one
     try { findMatchBtn.scrollIntoView({ block: 'center' }); } catch (_) {}   // show which row we're on
-    pendingThumb = getRowScan(findMatchBtn);
+    // opts.scan: on a MATCHED row the nearest image may be the catalog art, not the scan — review mode
+    // already read the row's captioned scan, so it hands it over rather than letting us guess.
+    pendingThumb = opts.scan || getRowScan(findMatchBtn);
     pendingQuery = query;
     pendingNum = ''; pendingCard = ''; pendingName = ''; pendingSet = ''; pendingSetName = '';
-    try { await quickMatch(findMatchBtn, query, setStatus); }
-    catch (e) { console.error('[QuickMatch]', e); setStatus('failed: ' + e.message); }
+    try { await quickMatch(findMatchBtn, query, setStatus, opts); }
+    catch (e) {
+      console.error('[QuickMatch]', e);
+      setStatus('failed: ' + e.message, 'warn');
+      pendingFixScope = null;              // a failed repair must not retire its row
+    }
     qInput.focus();   // keep Enter routed to the happy-path state machine
   }
 
   function decorate() {
     for (const b of [...document.querySelectorAll('button')]) {
-      if (txt(b) !== 'Find Match' || b.dataset.qmDone) continue;
-      b.dataset.qmDone = '1';
-      const zap = document.createElement('button');
-      zap.textContent = '⚡';
-      zap.title = 'Quick match using the box bottom-left';
-      zap.style.cssText = 'margin-left:6px;cursor:pointer;font-size:14px';
-      zap.onclick = e => { e.preventDefault(); run(b); };
-      b.after(zap);
+      const label = txt(b);
+      if (label === FIND_MATCH && !b.dataset.qmDone) {
+        b.dataset.qmDone = '1';
+        const zap = document.createElement('button');
+        zap.textContent = '⚡';
+        zap.title = 'Quick match using the box bottom-left';
+        zap.style.cssText = 'margin-left:6px;cursor:pointer;font-size:14px';
+        zap.onclick = e => { e.preventDefault(); run(b); };
+        b.after(zap);
+      } else if (label === FIND_NEW && !b.dataset.qmFixDone) {
+        b.dataset.qmFixDone = '1';
+        // on every matched row, not just the bad ones: the row's set text may not have painted yet
+        // when we decorate, and we only get one shot per button. It reads the row fresh on click.
+        const wrench = document.createElement('button');
+        wrench.textContent = '🔧';
+        wrench.title = 'Re-match this row to the base set of its own card number';
+        wrench.style.cssText = 'margin-left:6px;cursor:pointer;font-size:14px';
+        wrench.onclick = e => {
+          e.preventDefault();
+          const scope = rowScopeOf(b, FIND_NEW), num = rowNumberOf(scope);
+          if (!num) { setStatus('no card # on that row', 'warn'); return; }
+          qInput.value = num;
+          renderRecents(num);
+          fixRow({ btn: b, scope, num });
+        };
+        b.after(wrench);
+      }
     }
   }
   // debounce to one decorate per frame — TCGplayer's SPA mutates the DOM constantly
