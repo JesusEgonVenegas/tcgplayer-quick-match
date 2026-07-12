@@ -8,7 +8,13 @@ A userscript that turns the **TCGplayer Seller Portal → Scan & Identify** page
 
 ## Demo
 
+**Matching unidentified scans** — type a number, Enter to open and auto-select, glance at the scan-vs-catalog comparison, Enter to save.
+
 ![Quick Match demo — type a number, Enter to open and auto-select, glance at the scan-vs-catalog comparison, Enter to save](docs/demo.gif)
+
+**Review mode** — auditing what the scanner already matched: both images enlarged, Enter to approve, X to re-match. Corrections it has seen before get flagged and applied in one keypress.
+
+![Review mode demo — walking the Matched to Catalog rows, approving good matches with Enter and re-matching wrong ones with X](docs/review-demo.gif)
 
 ---
 
